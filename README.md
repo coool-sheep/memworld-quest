@@ -52,16 +52,13 @@ python ./scripts/reproject_quest_dataset.py --name your_dataset_name
 
 ## Deployment
 
-### AppStore Available
-
-You can download the app from [Meta Quest Store](https://www.meta.com/experiences/hand-tracking-streamer/26303946202523164), or sideload the app with [SideQuest](https://sidequestvr.com/app/46236/hand-tracking-streamer) for free.
 
 ### Local Builds
 
-Alternatively, you can build from source by loading `hand_tracking_streamer` project in [Unity](https://unity.com/download) or directly upload `hand_tracking_streamer.apk` via ADB to your device.
+Please directly upload `hand_tracking_video_streamer.apk` via ADB to your device.
 
 >[!NOTE]
->Before direct upload, make sure your device is set to [developer mode](https://developers.meta.com/horizon/documentation/native/android/mobile-device-setup/), and allow USB connection. This app is built and tested on Unity 6000.0.65f1
+>Before direct upload, make sure your device is set to [developer mode](https://developers.meta.com/horizon/documentation/native/android/mobile-device-setup/), and allow USB connection. This app is built and tested on Unity 6000.4.1f1
 
 ## Data Streaming
 
@@ -90,6 +87,8 @@ For integrating HTS data into your own pipelines, use the official [Python SDK](
 ```bash
 # if using uv
 uv add hand-tracking-sdk
+# or just
+uv init && uv venv && uv sync
 
 # or install via pip
 pip install hand-tracking-sdk
