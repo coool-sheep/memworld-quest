@@ -18,7 +18,6 @@ import io
 import json
 import logging
 import socket
-import struct
 import threading
 import time
 from collections import deque
@@ -42,13 +41,7 @@ from hts_dataset_utils import (
     landmarks_local_to_world,
     parse_hts_line,
 )
-
-
-FRAME_MAGIC = 0x4D414351
-METADATA_MAGIC = 0x41544D51
-PROTOCOL_VERSION = 1
-HEADER_STRUCT = struct.Struct("<IBBHHBBIQI")
-METADATA_HEADER_STRUCT = struct.Struct("<IBBHI")
+from quest_camera_receiver import handle_camera_client_stream
 
 DEFAULT_OUTPUT_ROOT = "./data"
 DEFAULT_DATASET_FPS = 15
@@ -63,6 +56,9 @@ DEFAULT_CAMERA_PITCH_DEG = 0.0
 DEFAULT_CAMERA_YAW_DEG = 0.0
 DEFAULT_CAMERA_ROLL_DEG = 0.0
 DEFAULT_ENABLE_PREVIEW = True
+DEFAULT_VIDEO_WIDTH = 640
+DEFAULT_VIDEO_HEIGHT = 480
+PIL_RESAMPLING = getattr(Image, "Resampling", Image)
 
 
 @dataclass
@@ -232,8 +228,10 @@ class CameraTcpReceiver:
             logging.info("Camera client connected from %s:%d", addr[0], addr[1])
             try:
                 self._handle_client(conn)
-            except Exception as exc:
+            except ConnectionError as exc:
                 logging.warning("Camera client disconnected: %s", exc)
+            except Exception:
+                logging.exception("Unexpected camera receiver error.")
             finally:
                 try:
                     conn.close()
@@ -242,68 +240,28 @@ class CameraTcpReceiver:
                 logging.info("Camera client closed from %s:%d", addr[0], addr[1])
 
     def _handle_client(self, conn: socket.socket) -> None:
-        conn.settimeout(5.0)
-        while not self._stop_event.is_set():
-            magic = struct.unpack("<I", self._recv_exact(conn, 4))[0]
-            if magic == FRAME_MAGIC:
-                frame_header = struct.pack("<I", magic) + self._recv_exact(conn, HEADER_STRUCT.size - 4)
-                (
-                    _magic,
-                    version,
-                    _reserved0,
-                    width,
-                    height,
-                    _reserved1,
-                    _reserved2,
-                    frame_id,
-                    timestamp_ns,
-                    payload_size,
-                ) = HEADER_STRUCT.unpack(frame_header)
-
-                if version != PROTOCOL_VERSION:
-                    raise ConnectionError(f"Unsupported frame protocol version: {version}")
-                jpeg_bytes = self._recv_exact(conn, payload_size)
-                self.on_frame(
-                    CameraFrame(
-                        frame_id=frame_id,
-                        timestamp_ns=timestamp_ns,
-                        width=width,
-                        height=height,
-                        jpeg_bytes=jpeg_bytes,
-                        received_at_ns=time.monotonic_ns(),
-                    )
+        def on_frame(width: int, height: int, frame_id: int, timestamp_ns: int, jpeg_bytes: bytes) -> None:
+            self.on_frame(
+                CameraFrame(
+                    frame_id=frame_id,
+                    timestamp_ns=timestamp_ns,
+                    width=width,
+                    height=height,
+                    jpeg_bytes=jpeg_bytes,
+                    received_at_ns=time.monotonic_ns(),
                 )
-                continue
+            )
 
-            if magic == METADATA_MAGIC:
-                metadata_header = struct.pack("<I", magic) + self._recv_exact(conn, METADATA_HEADER_STRUCT.size - 4)
-                (
-                    _magic,
-                    version,
-                    _reserved0,
-                    _reserved1,
-                    payload_size,
-                ) = METADATA_HEADER_STRUCT.unpack(metadata_header)
-                if version != PROTOCOL_VERSION:
-                    raise ConnectionError(f"Unsupported metadata protocol version: {version}")
-                payload = self._recv_exact(conn, payload_size)
-                if self.on_metadata is not None:
-                    self.on_metadata(json.loads(payload.decode("utf-8")))
-                continue
+        def on_metadata(metadata: dict) -> None:
+            if self.on_metadata is not None:
+                self.on_metadata(metadata)
 
-            raise ConnectionError(f"Unexpected camera packet magic: 0x{magic:08X}")
-
-    @staticmethod
-    def _recv_exact(conn: socket.socket, size: int) -> bytes:
-        chunks: list[bytes] = []
-        remaining = size
-        while remaining > 0:
-            chunk = conn.recv(remaining)
-            if not chunk:
-                raise ConnectionError("Socket closed while reading camera stream.")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
+        handle_camera_client_stream(
+            conn,
+            on_frame=on_frame,
+            on_metadata=on_metadata,
+            should_stop=self._stop_event.is_set,
+        )
 
 
 class DatasetRecorder:
@@ -358,7 +316,7 @@ class DatasetRecorder:
         image = Image.open(io.BytesIO(frame.jpeg_bytes)).convert("RGB")
         rgb = np.asarray(image)
         self._ensure_writer(frame.width, frame.height)
-        self._writer.append_data(rgb)
+        self._writer.append_data(self._resize_for_video(image))
 
         with self._preview_lock:
             self._latest_preview_rgb = rgb
@@ -435,6 +393,11 @@ class DatasetRecorder:
             quality=8,
             macro_block_size=None,
         )
+
+    @staticmethod
+    def _resize_for_video(image: Image.Image) -> np.ndarray:
+        resized = image.resize((DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT), PIL_RESAMPLING.BILINEAR)
+        return np.asarray(resized)
 
     def _build_aligned_row(self, frame: CameraFrame) -> dict:
         row: dict[str, object] = {
@@ -561,6 +524,10 @@ class DatasetRecorder:
             "dataset_name": self.args.name,
             "created_at_unix_ns": self._session_started_ns,
             "video_path": self._video_path.name,
+            "video_resolution": {
+                "width": DEFAULT_VIDEO_WIDTH,
+                "height": DEFAULT_VIDEO_HEIGHT,
+            },
             "hand_endpoint": {
                 "host": DEFAULT_HAND_HOST,
                 "port": DEFAULT_HAND_PORT,

@@ -15,6 +15,7 @@ import socket
 import struct
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,7 +53,8 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _recv_exact(sock: socket.socket, size: int) -> bytes:
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    """Read exactly `size` bytes from `sock` (public for shared camera ingest)."""
     chunks: list[bytes] = []
     remaining = size
 
@@ -64,6 +66,73 @@ def _recv_exact(sock: socket.socket, size: int) -> bytes:
         remaining -= len(chunk)
 
     return b"".join(chunks)
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    return recv_exact(sock, size)
+
+
+def handle_camera_client_stream(
+    client: socket.socket,
+    *,
+    on_frame: Callable[[int, int, int, int, bytes], None],
+    on_metadata: Callable[[dict], None] | None,
+    should_stop: Callable[[], bool],
+) -> None:
+    """Process one Quest camera TCP connection (metadata packets first, then JPEG frames).
+
+    Matches the headset uplink protocol used by ``CameraReceiver._handle_client``. If the first
+    bytes are not camera metadata or frame magic (e.g. an HTTP client hit the port), logs a
+    warning and returns so the server can ``accept()`` the real Quest stream next.
+    """
+    client.settimeout(5.0)
+
+    while not should_stop():
+        magic = struct.unpack("<I", recv_exact(client, 4))[0]
+        if magic == METADATA_MAGIC:
+            header = struct.pack("<I", magic) + recv_exact(client, METADATA_HEADER_STRUCT.size - 4)
+            (
+                _magic,
+                version,
+                _reserved0,
+                _reserved1,
+                payload_size,
+            ) = METADATA_HEADER_STRUCT.unpack(header)
+            if version != PROTOCOL_VERSION:
+                raise ConnectionError(f"Unsupported metadata protocol version: {version}")
+            payload = recv_exact(client, payload_size)
+            if on_metadata is not None:
+                on_metadata(json.loads(payload.decode("utf-8")))
+            continue
+
+        if magic == FRAME_MAGIC:
+            header = struct.pack("<I", magic) + recv_exact(client, HEADER_STRUCT.size - 4)
+            (
+                _magic,
+                version,
+                _reserved0,
+                width,
+                height,
+                _reserved1,
+                _reserved2,
+                frame_id,
+                timestamp_ns,
+                payload_size,
+            ) = HEADER_STRUCT.unpack(header)
+            if version != PROTOCOL_VERSION:
+                raise ConnectionError(f"Unsupported protocol version: {version}")
+            if payload_size <= 0:
+                raise ConnectionError("Received empty JPEG payload.")
+            jpeg_bytes = recv_exact(client, payload_size)
+            on_frame(width, height, frame_id, timestamp_ns, jpeg_bytes)
+            continue
+
+        logging.warning(
+            "Ignoring non-camera TCP client (magic=0x%08X); closing connection. "
+            "If this repeats, something other than Quest is connecting to this port.",
+            magic,
+        )
+        return
 
 
 @dataclass
@@ -145,52 +214,7 @@ class CameraReceiver:
                 logging.info("Quest camera client closed.")
 
     def _handle_client(self, client: socket.socket) -> None:
-        client.settimeout(5.0)
-
-        while not self._stop_event.is_set():
-            magic = struct.unpack("<I", _recv_exact(client, 4))[0]
-            if magic == METADATA_MAGIC:
-                header = struct.pack("<I", magic) + _recv_exact(client, METADATA_HEADER_STRUCT.size - 4)
-                (
-                    _magic,
-                    version,
-                    _reserved0,
-                    _reserved1,
-                    payload_size,
-                ) = METADATA_HEADER_STRUCT.unpack(header)
-                if version != PROTOCOL_VERSION:
-                    raise ConnectionError(f"Unsupported metadata protocol version: {version}")
-                payload = _recv_exact(client, payload_size)
-                self._latest_metadata = json.loads(payload.decode("utf-8"))
-                logging.info(
-                    "camera calibration metadata received source=%s eye=%s",
-                    self._latest_metadata.get("source"),
-                    self._latest_metadata.get("camera_eye"),
-                )
-                continue
-
-            if magic != FRAME_MAGIC:
-                raise ConnectionError(f"Unexpected frame magic: 0x{magic:08X}")
-
-            header = struct.pack("<I", magic) + _recv_exact(client, HEADER_STRUCT.size - 4)
-            (
-                _magic,
-                version,
-                _reserved0,
-                width,
-                height,
-                _reserved1,
-                _reserved2,
-                frame_id,
-                timestamp_ns,
-                payload_size,
-            ) = HEADER_STRUCT.unpack(header)
-            if version != PROTOCOL_VERSION:
-                raise ConnectionError(f"Unsupported protocol version: {version}")
-            if payload_size <= 0:
-                raise ConnectionError("Received empty JPEG payload.")
-
-            jpeg_bytes = _recv_exact(client, payload_size)
+        def on_frame(width: int, height: int, frame_id: int, timestamp_ns: int, jpeg_bytes: bytes) -> None:
             image = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
             frame = CameraFrame(
                 width=width,
@@ -210,6 +234,21 @@ class CameraReceiver:
                 self.save_last.write_bytes(jpeg_bytes)
 
             self._log_stats(frame)
+
+        def on_metadata(metadata: dict) -> None:
+            self._latest_metadata = metadata
+            logging.info(
+                "camera calibration metadata received source=%s eye=%s",
+                metadata.get("source"),
+                metadata.get("camera_eye"),
+            )
+
+        handle_camera_client_stream(
+            client,
+            on_frame=on_frame,
+            on_metadata=on_metadata,
+            should_stop=self._stop_event.is_set,
+        )
 
     def _log_stats(self, frame: CameraFrame) -> None:
         now = time.monotonic()

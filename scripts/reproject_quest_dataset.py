@@ -98,13 +98,33 @@ def _draw_hand_overlay(
 
 def _resolve_intrinsics(
     session: dict,
+    source_width: int | None,
+    source_height: int | None,
     frame_width: int,
     frame_height: int,
 ) -> dict:
+    source_width = int(source_width or frame_width)
+    source_height = int(source_height or frame_height)
+    scale_x = frame_width / max(source_width, 1)
+    scale_y = frame_height / max(source_height, 1)
+
     calibration = session.get("camera_calibration")
     if calibration is not None:
         calibration = dict(calibration)
-        calibration.setdefault("current_resolution", [frame_width, frame_height])
+        focal = calibration.get("focal_length")
+        principal = calibration.get("principal_point")
+        if focal is not None:
+            calibration["focal_length"] = [
+                float(focal[0]) * scale_x,
+                float(focal[1]) * scale_y,
+            ]
+        if principal is not None:
+            calibration["principal_point"] = [
+                float(principal[0]) * scale_x,
+                float(principal[1]) * scale_y,
+            ]
+        calibration["sensor_resolution"] = [frame_width, frame_height]
+        calibration["current_resolution"] = [frame_width, frame_height]
         return calibration
 
     defaults = session.get("projection_defaults") or {}
@@ -114,10 +134,13 @@ def _resolve_intrinsics(
     return {
         "current_resolution": [frame_width, frame_height],
         "sensor_resolution": [frame_width, frame_height],
-        "focal_length": [float(defaults["fx"]), float(defaults["fy"])],
+        "focal_length": [
+            float(defaults["fx"]) * scale_x,
+            float(defaults["fy"]) * scale_y,
+        ],
         "principal_point": [
-            float(defaults.get("cx", frame_width * 0.5)),
-            float(defaults.get("cy", frame_height * 0.5)),
+            float(defaults.get("cx", source_width * 0.5)) * scale_x,
+            float(defaults.get("cy", source_height * 0.5)) * scale_y,
         ],
         "lens_offset_position": session.get("camera_offset_local_m") or DEFAULT_CAMERA_OFFSET.tolist(),
         "lens_offset_rotation": session.get("camera_rotation_offset_quaternion") or DEFAULT_CAMERA_ROTATION_OFFSET.tolist(),
@@ -168,7 +191,13 @@ def main() -> None:
 
             row = aligned_rows[index]
             pil_image = Image.fromarray(frame).convert("RGB")
-            calibration = _resolve_intrinsics(session, pil_image.width, pil_image.height)
+            calibration = _resolve_intrinsics(
+                session,
+                source_width=row.get("camera_width"),
+                source_height=row.get("camera_height"),
+                frame_width=pil_image.width,
+                frame_height=pil_image.height,
+            )
 
             camera_position = row.get("camera_position_world")
             camera_quaternion = row.get("camera_quaternion_world")
