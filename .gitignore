@@ -54,3 +54,5 @@ coverage.xml
 
 # Unity build artifact
 *_DoNotShip
+
+test_data/
