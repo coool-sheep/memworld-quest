@@ -58,6 +58,7 @@ DEFAULT_CAMERA_ROLL_DEG = 0.0
 DEFAULT_ENABLE_PREVIEW = True
 DEFAULT_VIDEO_WIDTH = 640
 DEFAULT_VIDEO_HEIGHT = 480
+DEFAULT_SEGMENT_KEY = "n"
 PIL_RESAMPLING = getattr(Image, "Resampling", Image)
 
 
@@ -76,6 +77,26 @@ class CameraFrame:
     height: int
     jpeg_bytes: bytes
     received_at_ns: int
+
+
+@dataclass
+class SegmentRecord:
+    segment_index: int
+    label: str
+    start_frame_index: int
+    end_frame_index: int
+    start_timestamp_ns: int
+    end_timestamp_ns: int
+
+    def to_dict(self) -> dict[str, int | str]:
+        return {
+            "segment_index": self.segment_index,
+            "label": self.label,
+            "start_frame_index": self.start_frame_index,
+            "end_frame_index": self.end_frame_index,
+            "start_timestamp_ns": self.start_timestamp_ns,
+            "end_timestamp_ns": self.end_timestamp_ns,
+        }
 
 
 class TimedSampleBuffer:
@@ -268,6 +289,7 @@ class DatasetRecorder:
     def __init__(self, output_dir: Path, args: argparse.Namespace) -> None:
         self.output_dir = output_dir
         self.args = args
+        self.segmentation_enabled = bool(args.enable_segmentation)
         self.telemetry_buffers = {
             ("head", "pose"): TimedSampleBuffer(),
             ("left", "wrist"): TimedSampleBuffer(),
@@ -292,9 +314,18 @@ class DatasetRecorder:
         self._camera_offset = default_camera_offset(DEFAULT_CAMERA_EYE)
         self._intrinsics: dict[str, float] | None = None
         self._video_path = self.output_dir / "camera.mp4"
+        self._segments_path = self.output_dir / "segments.json"
         self._telemetry_lock = threading.Lock()
         self._camera_metadata: dict | None = None
         self._pending_camera_pose_by_frame_id: dict[int, dict] = {}
+        self._camera_state_lock = threading.Lock()
+        self._latest_camera_frame_index: int | None = None
+        self._latest_camera_timestamp_ns: int | None = None
+        self._open_segment_index: int | None = None
+        self._current_segment_start_frame_index: int | None = None
+        self._current_segment_start_timestamp_ns: int | None = None
+        self._next_segment_index = 1
+        self._segments: list[SegmentRecord] = []
 
     def on_telemetry_sample(self, stream: str, kind: str, sample: TelemetrySample, raw_label: str) -> None:
         key = (stream, kind)
@@ -322,17 +353,21 @@ class DatasetRecorder:
             self._latest_preview_rgb = rgb
 
         self._frame_counter += 1
-        self.camera_rows.append(
-            {
-                "camera_frame_index": len(self.camera_rows),
-                "camera_frame_id": frame.frame_id,
-                "camera_timestamp_ns": frame.timestamp_ns,
-                "camera_received_at_ns": frame.received_at_ns,
-                "width": frame.width,
-                "height": frame.height,
-            }
-        )
+        camera_row = {
+            "camera_frame_index": len(self.camera_rows),
+            "camera_frame_id": frame.frame_id,
+            "camera_timestamp_ns": frame.timestamp_ns,
+            "camera_received_at_ns": frame.received_at_ns,
+            "width": frame.width,
+            "height": frame.height,
+        }
+        self.camera_rows.append(camera_row)
         self.aligned_rows.append(self._build_aligned_row(frame))
+
+        with self._camera_state_lock:
+            self._latest_camera_frame_index = int(camera_row["camera_frame_index"])
+            self._latest_camera_timestamp_ns = frame.timestamp_ns
+            self._start_segment_locked_if_needed()
 
         elapsed = max(time.monotonic() - self._fps_started_at, 1e-6)
         if self._frame_counter % max(int(self.args.fps), 1) == 0:
@@ -369,11 +404,117 @@ class DatasetRecorder:
                 return None
             return self._latest_preview_rgb.copy()
 
+    def mark_next_segment(self) -> bool:
+        if not self.segmentation_enabled:
+            logging.warning("Segmentation is disabled; ignoring segment key.")
+            return False
+
+        with self._camera_state_lock:
+            if self._latest_camera_frame_index is None or self._latest_camera_timestamp_ns is None:
+                logging.warning("Ignoring segment key because no camera frame has been recorded yet.")
+                return False
+            if self._open_segment_index is None:
+                logging.warning("Ignoring segment key because the next segment has not started yet.")
+                return False
+            if self._current_segment_start_frame_index is None or self._current_segment_start_timestamp_ns is None:
+                logging.warning("Ignoring segment key because the current segment start is unavailable.")
+                return False
+            if self._latest_camera_frame_index < self._current_segment_start_frame_index:
+                logging.warning(
+                    "Ignoring segment key because it would create an empty segment start=%d end=%d.",
+                    self._current_segment_start_frame_index,
+                    self._latest_camera_frame_index,
+                )
+                return False
+
+            record = SegmentRecord(
+                segment_index=self._open_segment_index,
+                label=f"seg{self._open_segment_index}",
+                start_frame_index=self._current_segment_start_frame_index,
+                end_frame_index=self._latest_camera_frame_index,
+                start_timestamp_ns=self._current_segment_start_timestamp_ns,
+                end_timestamp_ns=self._latest_camera_timestamp_ns,
+            )
+            self._segments.append(record)
+            self._open_segment_index = None
+            self._current_segment_start_frame_index = None
+            self._current_segment_start_timestamp_ns = None
+
+        logging.info(
+            "Closed segment %s frames=%d..%d",
+            record.label,
+            record.start_frame_index,
+            record.end_frame_index,
+        )
+        logging.info("The next segment will start on the next recorded camera frame.")
+        return True
+
     def close(self) -> None:
+        self._finalize_open_segment()
         if self._writer is not None:
             self._writer.close()
             self._writer = None
         self._write_outputs()
+
+    def _start_segment_locked_if_needed(self) -> None:
+        if not self.segmentation_enabled:
+            return
+        if self._open_segment_index is not None:
+            return
+        if self._latest_camera_frame_index is None or self._latest_camera_timestamp_ns is None:
+            return
+
+        self._open_segment_index = self._next_segment_index
+        self._next_segment_index += 1
+        self._current_segment_start_frame_index = self._latest_camera_frame_index
+        self._current_segment_start_timestamp_ns = self._latest_camera_timestamp_ns
+        logging.info(
+            "Started segment seg%d at frame=%d",
+            self._open_segment_index,
+            self._current_segment_start_frame_index,
+        )
+
+    def _finalize_open_segment(self) -> None:
+        if not self.segmentation_enabled:
+            return
+
+        with self._camera_state_lock:
+            if self._open_segment_index is None:
+                return
+            if self._latest_camera_frame_index is None or self._latest_camera_timestamp_ns is None:
+                return
+            if self._current_segment_start_frame_index is None or self._current_segment_start_timestamp_ns is None:
+                return
+            if self._latest_camera_frame_index < self._current_segment_start_frame_index:
+                return
+
+            record = SegmentRecord(
+                segment_index=self._open_segment_index,
+                label=f"seg{self._open_segment_index}",
+                start_frame_index=self._current_segment_start_frame_index,
+                end_frame_index=self._latest_camera_frame_index,
+                start_timestamp_ns=self._current_segment_start_timestamp_ns,
+                end_timestamp_ns=self._latest_camera_timestamp_ns,
+            )
+            self._segments.append(record)
+            self._open_segment_index = None
+            self._current_segment_start_frame_index = None
+            self._current_segment_start_timestamp_ns = None
+
+        logging.info(
+            "Closed final segment %s frames=%d..%d",
+            record.label,
+            record.start_frame_index,
+            record.end_frame_index,
+        )
+
+    def _build_segments_payload(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "mode": "manual_keypress",
+            "segment_key": DEFAULT_SEGMENT_KEY,
+            "segments": [segment.to_dict() for segment in self._segments],
+        }
 
     def _ensure_writer(self, width: int, height: int) -> None:
         if self._writer is not None:
@@ -519,6 +660,11 @@ class DatasetRecorder:
         pq.write_table(telemetry_table, self.output_dir / "telemetry_raw.parquet")
         pq.write_table(camera_table, self.output_dir / "camera_frames.parquet")
         pq.write_table(aligned_table, self.output_dir / "aligned_frames.parquet")
+        if self.segmentation_enabled:
+            self._segments_path.write_text(
+                json.dumps(self._build_segments_payload(), indent=2),
+                encoding="utf-8",
+            )
 
         session = {
             "dataset_name": self.args.name,
@@ -537,6 +683,8 @@ class DatasetRecorder:
                 "port": DEFAULT_CAMERA_PORT,
             },
             "fps": self.args.fps,
+            "segmentation_enabled": self.segmentation_enabled,
+            "segments_path": self._segments_path.name if self.segmentation_enabled else None,
             "camera_eye": DEFAULT_CAMERA_EYE,
             "camera_offset_local_m": self._camera_offset.tolist(),
             "camera_rotation_offset_quaternion": self._camera_rotation_offset.tolist(),
@@ -575,6 +723,11 @@ def _create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--name", required=True, help="Dataset name. Output will be ./data/{name}.")
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, help="Root folder for datasets.")
     parser.add_argument("--fps", type=int, default=DEFAULT_DATASET_FPS, help="Dataset video/playback fps.")
+    parser.add_argument(
+        "--enable-segmentation",
+        action="store_true",
+        help=f"Enable manual segmentation. Press {DEFAULT_SEGMENT_KEY} in the preview window to start the next segment.",
+    )
     return parser
 
 
@@ -588,9 +741,13 @@ def _run_preview_loop(recorder: DatasetRecorder) -> None:
 
     def _handle_key_press(event) -> None:
         nonlocal stop_requested
-        if event.key == "q":
+        key = (event.key or "").lower()
+        if key == "q":
             stop_requested = True
             plt.close(figure)
+            return
+        if key == DEFAULT_SEGMENT_KEY:
+            recorder.mark_next_segment()
 
     figure.canvas.mpl_connect("key_press_event", _handle_key_press)
 
@@ -630,7 +787,15 @@ def main() -> None:
     camera_receiver.start()
 
     if DEFAULT_ENABLE_PREVIEW:
-        logging.info("Waiting for Quest streams. Focus the preview window and press q, or press Ctrl+C to stop recording.")
+        if args.enable_segmentation:
+            logging.info(
+                "Waiting for Quest streams. Focus the preview window and press %s to split segments, q to stop recording.",
+                DEFAULT_SEGMENT_KEY,
+            )
+        else:
+            logging.info(
+                "Waiting for Quest streams. Focus the preview window and press q, or press Ctrl+C to stop recording."
+            )
     else:
         logging.info("Waiting for Quest streams. Press Ctrl+C to stop recording.")
     logging.info("ADB reverse commands:")

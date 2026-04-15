@@ -43,6 +43,25 @@ adb reverse tcp:8765 tcp:8765
 python ./scripts/record_quest_dataset.py --name your_dataset_name --output-root ./data --fps 30
 ```
 
+If you want to manually split one recording into multiple segments, enable segmentation and use the preview window:
+
+```bash
+python ./scripts/record_quest_dataset.py --name your_dataset_name --output-root ./data --fps 30 --enable-segmentation
+```
+
+While recording:
+
+- press `n` in the preview window to close the current segment and start the next one
+- press `q` to stop recording
+
+When segmentation is enabled, the dataset directory also includes `segments.json`.
+
+To export `seg1 + segN` combinations after recording:
+
+```bash
+python ./scripts/export_stage_combinations.py --name your_dataset_name --output-root ./data
+```
+
 5. vissualize dataset:
 
 ```bash
