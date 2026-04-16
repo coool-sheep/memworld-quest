@@ -7,6 +7,8 @@
 
 **Hand Tracking Streamer** is a lightweight hand telemetry utility that turns a Meta Quest headset into a precision controller for robotics teleoperation and motion capture. Built on the Meta Interaction SDK, it streams 21-landmark hand data and 6-DoF wrist pose to a PC in real time over Wi-Fi using UDP for ultra-low latency or TCP for reliable data logging. The app supports left, right, or dual-hand modes with in-headset configuration, and includes a live log console and phantom hand visualization for debugging. Data is sent as structured packets of joint positions and orientations in Unity world space, making it suitable for robot control, imitation learning, and gesture-based prototyping.
 
+如果你是数采员，只想看最简单的操作说明，直接看 [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md)。
+
 ## Camera Uplink Status
 
 This repository now includes a Quest-to-PC camera uplink path designed for **fixed TCP ports** and **USB wired use via `adb reverse`**:
