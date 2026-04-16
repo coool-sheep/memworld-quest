@@ -165,6 +165,25 @@ def _write_manifest(
     output_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+def _write_export_session(
+    output_path: Path,
+    *,
+    session: dict,
+    combo_name: str,
+    source_frame_indices: list[int],
+    include_aligned: bool,
+) -> None:
+    exported_session = deepcopy(session)
+    exported_session["dataset_name"] = combo_name
+    exported_session["video_path"] = "camera.mp4"
+    exported_session["aligned_frames_path"] = "aligned_frames.parquet" if include_aligned else None
+    exported_session["export_combo_name"] = combo_name
+    exported_session["export_source_frame_count"] = len(source_frame_indices)
+    exported_session["export_source_frame_index_start"] = source_frame_indices[0] if source_frame_indices else None
+    exported_session["export_source_frame_index_end"] = source_frame_indices[-1] if source_frame_indices else None
+    output_path.write_text(json.dumps(exported_session, indent=2), encoding="utf-8")
+
+
 def main() -> None:
     args = _build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -210,6 +229,13 @@ def main() -> None:
                     f"Frame count mismatch for {output_dir.name}: video={frames_written}, aligned={aligned_rows_written}"
                 )
 
+        _write_export_session(
+            output_path=output_dir / "session.json",
+            session=session,
+            combo_name=output_dir.name,
+            source_frame_indices=source_frame_indices,
+            include_aligned=args.include_aligned,
+        )
         _write_manifest(
             output_path=output_dir / "export_manifest.json",
             dataset_name=args.name,

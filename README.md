@@ -62,6 +62,71 @@ To export `seg1 + segN` combinations after recording:
 python ./scripts/export_stage_combinations.py --name your_dataset_name --output-root ./data
 ```
 
+### Segmented Recording Workflow
+
+如果一整段录制里包含多个阶段，比如 `A -> B -> C -> D`，就用分段模式。
+
+开始录制：
+
+```bash
+python ./scripts/record_quest_dataset.py --name demo_segments --output-root ./data --fps 30 --enable-segmentation
+```
+
+录制时只记这几件事：
+
+- 第一个真正录到的相机帧会自动开始 `seg1`
+- 每按一次 `n`，结束当前段，下一段从下一帧开始
+- 最后按 `q` 停止录制，最后一段会自动封口
+
+录完以后原始目录大概是：
+
+```text
+data/demo_segments/
+  camera.mp4
+  camera_frames.parquet
+  aligned_frames.parquet
+  telemetry_raw.parquet
+  session.json
+  segments.json
+```
+
+其中 `segments.json` 记录每一段的起止帧和时间戳。
+
+然后导出组合：
+
+```bash
+python ./scripts/export_stage_combinations.py --name demo_segments --output-root ./data
+```
+
+导出后会生成：
+
+```text
+data/demo_segments/exports/
+  seg1_seg2/
+    camera.mp4
+    aligned_frames.parquet
+    session.json
+    export_manifest.json
+  seg1_seg3/
+    camera.mp4
+    aligned_frames.parquet
+    session.json
+    export_manifest.json
+  seg1_seg4/
+    camera.mp4
+    aligned_frames.parquet
+    session.json
+    export_manifest.json
+```
+
+意思就是：
+
+- `seg1` is always the first recorded segment
+- exports are generated as `seg1 + segN`
+- exported `aligned_frames.parquet` is rebuilt to match the exported video frame order
+- exported folders now include `camera.mp4 + session.json + aligned_frames.parquet`
+- if you only recorded two segments, only `seg1_seg2` is generated
+
 5. vissualize dataset:
 
 ```bash
