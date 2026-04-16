@@ -127,6 +127,37 @@ data/demo_segments/exports/
 - exported folders now include `camera.mp4 + session.json + aligned_frames.parquet`
 - if you only recorded two segments, only `seg1_seg2` is generated
 
+### Segment Inspection Sheets
+
+如果你想快速检查每一段的大致内容，可以直接从原始录制目录生成 contact sheet：
+
+```bash
+python ./scripts/generate_segment_contact_sheets.py --name demo_segments --output-root ./data
+```
+
+这一步读取的是原始目录里的：
+
+- `camera.mp4`
+- `session.json`
+- `segments.json`
+
+输出会放到：
+
+```text
+data/demo_segments/inspection/
+  seg1_sheet01.png
+  seg2_sheet01.png
+  seg2_sheet02.png
+  inspection_manifest.json
+```
+
+规则是：
+
+- `seg1` 均匀采样 32 帧
+- `seg2+` 每 4 帧采样 1 帧
+- 每张图最多放 32 帧
+- 超过 32 帧就自动拆成 `sheet02`, `sheet03` ...
+
 5. vissualize dataset:
 
 ```bash
