@@ -100,8 +100,6 @@ def _resolve_intrinsics(
     session: dict,
     source_width: int | None,
     source_height: int | None,
-    source_width: int | None,
-    source_height: int | None,
     frame_width: int,
     frame_height: int,
 ) -> dict:
